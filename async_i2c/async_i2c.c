@@ -3,12 +3,23 @@
 
 #include "async_i2c.h"
 
+static void set_target_addr(AsyncI2CHandle *handle, uint8_t addr);
 static void handle_tx_empty_irq(AsyncI2CHandle *handle);
+static void handle_rx_full_irq(AsyncI2CHandle *handle);
 
-void async_i2c_init(AsyncI2CHandle *handle)
+AsyncI2CStatus async_i2c_init(AsyncI2CHandle *handle)
 {
+    if (handle->baudrate == 0)
+        return ASYNC_I2C_ERR;
+
+    if (handle->instance == NULL)
+        return ASYNC_I2C_ERR;
+
     handle->tx_data = NULL;
+    handle->rx_data = NULL;
     handle->tx_cplt_callback = NULL;
+    handle->rx_cplt_callback = NULL;
+    handle->error_callback = NULL;
 
     // disable i2c
     handle->instance->enable &= ~(1 << I2C_IC_ENABLE_ENABLE_LSB);
@@ -57,21 +68,20 @@ void async_i2c_init(AsyncI2CHandle *handle)
     // enable i2c
     handle->instance->enable |= (1 << I2C_IC_ENABLE_ENABLE_LSB);
 
-    handle->tx_state = ASYNC_I2C_STATE_TX_READY;
+    handle->tx_state = ASYNC_I2C_STATE_READY;
+    handle->rx_state = ASYNC_I2C_STATE_READY;
+
+    return ASYNC_I2C_OK;
 }
 
 AsyncI2CStatus async_i2c_transmit(AsyncI2CHandle *handle, uint8_t addr, void *data, uint16_t len)
 {
-    if ((handle->tx_state != ASYNC_I2C_STATE_TX_READY) || (data == NULL) || (len == 0))
+    if ((handle->tx_state != ASYNC_I2C_STATE_READY) || (data == NULL) || (len == 0))
         return ASYNC_I2C_ERR;
 
-    handle->tx_state = ASYNC_I2C_STATE_TX_BUSY;
-
-    handle->instance->enable &= ~(1 << I2C_IC_ENABLE_ENABLE_LSB);
-    handle->instance->tar = addr;
-    handle->instance->enable |= (1 << I2C_IC_ENABLE_ENABLE_LSB);
-
     uint32_t i2c_cmd = 0;
+    handle->tx_state = ASYNC_I2C_STATE_BUSY;
+    set_target_addr(handle, addr);
 
     // one byte is loaded in this function call
     len--;
@@ -87,7 +97,7 @@ AsyncI2CStatus async_i2c_transmit(AsyncI2CHandle *handle, uint8_t addr, void *da
         i2c_cmd |= (1 << I2C_IC_DATA_CMD_STOP_LSB);
 
         // i2c will be ready to use after this function call
-        handle->tx_state = ASYNC_I2C_STATE_TX_READY;
+        handle->tx_state = ASYNC_I2C_STATE_READY;
 
         // push first command
         handle->instance->data_cmd = i2c_cmd;
@@ -108,9 +118,64 @@ AsyncI2CStatus async_i2c_transmit(AsyncI2CHandle *handle, uint8_t addr, void *da
     return ASYNC_I2C_OK;
 }
 
-void async_i2c_register_tx_cplt_callback(AsyncI2CHandle *handle, void (*callback)(i2c_hw_t *))
+AsyncI2CStatus async_i2c_recieve(AsyncI2CHandle *handle, uint8_t addr, void *data, uint16_t len)
 {
-    handle->tx_cplt_callback = callback;
+    if ((handle->rx_state != ASYNC_I2C_STATE_READY) || (data == NULL) || (len == 0))
+        return ASYNC_I2C_ERR;
+
+    uint32_t i2c_cmd = 0;
+    handle->rx_state = ASYNC_I2C_STATE_BUSY;
+    set_target_addr(handle, addr);
+
+    handle->rx_data = data;
+    handle->rx_len = len;
+
+    if (len == 1)
+        i2c_cmd |= (1 << I2C_IC_DATA_CMD_STOP_LSB);
+
+    // mark as read command
+    i2c_cmd |= (1 << I2C_IC_DATA_CMD_CMD_LSB);
+
+    // generate RX_FULL interrupt when one byte in rx fifo
+    handle->instance->rx_tl = 0;
+
+    // enable interrupt
+    handle->instance->intr_mask |= (1 << I2C_IC_INTR_MASK_M_RX_FULL_LSB);
+
+    // push command
+    handle->instance->data_cmd = i2c_cmd;
+
+    return ASYNC_I2C_OK;
+}
+
+AsyncI2CStatus async_i2c_register_tx_cplt_callback(AsyncI2CHandle *handle, void (*callback)(i2c_hw_t *))
+{
+    if (callback != NULL)
+    {
+        handle->tx_cplt_callback = callback;
+        return ASYNC_I2C_OK;
+    }
+    return ASYNC_I2C_ERR;
+}
+
+AsyncI2CStatus async_i2c_register_rx_cplt_callback(AsyncI2CHandle *handle, void (*callback)(i2c_hw_t *))
+{
+    if (callback != NULL)
+    {
+        handle->rx_cplt_callback = callback;
+        return ASYNC_I2C_OK;
+    }
+    return ASYNC_I2C_ERR;
+}
+
+AsyncI2CStatus async_i2c_register_error_callback(AsyncI2CHandle *handle, void (*callback)(i2c_hw_t *))
+{
+    if (callback != NULL)
+    {
+        handle->error_callback = callback;
+        return ASYNC_I2C_OK;
+    }
+    return ASYNC_I2C_ERR;
 }
 
 void async_i2c_irq_handler(AsyncI2CHandle *handle)
@@ -120,9 +185,17 @@ void async_i2c_irq_handler(AsyncI2CHandle *handle)
     {
         handle_tx_empty_irq(handle);
     }
+    // rx fifo hit threshold
+    else if (handle->instance->intr_stat & I2C_IC_INTR_STAT_R_RX_FULL_BITS)
+    {
+        handle_rx_full_irq(handle);
+    }
     else
     {
         uint32_t dummy_read = handle->instance->clr_intr;
+
+        if (handle->error_callback != NULL)
+            handle->error_callback(handle->instance);
     }
 }
 
@@ -143,7 +216,7 @@ static void handle_tx_empty_irq(AsyncI2CHandle *handle)
         // last byte must be pushed before calling user callback
         handle->instance->data_cmd = i2c_cmd;
 
-        handle->tx_state = ASYNC_I2C_STATE_TX_READY;
+        handle->tx_state = ASYNC_I2C_STATE_READY;
 
         // call user callback
         if (handle->tx_cplt_callback != NULL)
@@ -156,4 +229,44 @@ static void handle_tx_empty_irq(AsyncI2CHandle *handle)
     handle->instance->data_cmd = i2c_cmd;
 
     // cleared automatically by hardware
+}
+
+static void handle_rx_full_irq(AsyncI2CHandle *handle)
+{
+    uint32_t i2c_cmd = 0;
+
+    *((uint8_t *)handle->rx_data) = (handle->instance->data_cmd & 0xff);
+
+    handle->rx_len--;
+
+    if (handle->rx_len >= 1)
+    {
+        handle->rx_data++;
+
+        // prepare next byte read
+        i2c_cmd |= (1 << I2C_IC_DATA_CMD_CMD_LSB);
+        if (handle->rx_len == 1)
+            i2c_cmd |= (1 << I2C_IC_DATA_CMD_STOP_LSB);
+
+        // push command
+        handle->instance->data_cmd = i2c_cmd;
+    }
+    else
+    {
+        // length is 0 - last byte recieved
+        handle->instance->intr_mask &= ~(1 << I2C_IC_INTR_MASK_M_RX_FULL_LSB);
+        handle->rx_state = ASYNC_I2C_STATE_READY;
+
+        if (handle->rx_cplt_callback != NULL)
+            handle->rx_cplt_callback(handle->instance);
+    }
+
+    // flag cleared by hardware
+}
+
+static void set_target_addr(AsyncI2CHandle *handle, uint8_t addr)
+{
+    handle->instance->enable &= ~(1 << I2C_IC_ENABLE_ENABLE_LSB);
+    handle->instance->tar = addr;
+    handle->instance->enable |= (1 << I2C_IC_ENABLE_ENABLE_LSB);
 }
